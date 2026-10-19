@@ -1,0 +1,136 @@
+name: JARVIS Android Build
+
+# Builds a DEBUG-signed APK with Buildozer + python-for-android and uploads it as an artifact.
+# Pinned toolchain (keep in sync with buildozer.spec and README):
+#   Python 3.11, Java 17 (Temurin), Buildozer 1.5.0, Cython 0.29.36, Android API 33, NDK 25b.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILDOZER_VERSION: "1.5.0"
+  CYTHON_VERSION: "0.29.36"
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  android-build:
+    name: Build debug APK
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip build-essential ccache autoconf automake libtool libtool-bin pkg-config patch \
+            zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev libltdl-dev
+
+      - name: Install Buildozer toolchain
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "buildozer==${BUILDOZER_VERSION}" "cython==${CYTHON_VERSION}" virtualenv
+
+      - name: Cache Android SDK/NDK and python-for-android build state
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}-${{ env.BUILDOZER_VERSION }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+
+      - name: Validate buildozer.spec
+        run: |
+          python - <<'PY'
+          import configparser, sys
+          cp = configparser.ConfigParser(interpolation=None)
+          cp.read("buildozer.spec")
+          app = cp["app"]
+          for key in ("title", "package.name", "package.domain", "requirements", "android.api", "android.ndk", "android.archs"):
+              if not app.get(key):
+                  sys.exit(f"buildozer.spec is missing [app] {key}")
+          print("buildozer.spec OK:", app["package.name"], app["version"], "api", app["android.api"], "ndk", app["android.ndk"])
+          PY
+
+      - name: Build debug APK
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee buildozer-build.log
+
+      - name: Locate APK
+        id: apk
+        run: |
+          # Buildozer writes to ./bin by default; search rather than assume the file name.
+          APK="$(find bin -maxdepth 2 -name '*.apk' -print | sort | head -n 1)"
+          if [ -z "$APK" ]; then
+            echo "::error::Build finished but no APK was found under ./bin"
+            exit 1
+          fi
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          {
+            echo "## JARVIS build summary"
+            echo "- Status: success"
+            echo "- APK: \`$APK\` ($(du -h "$APK" | cut -f1))"
+            echo "- Signing: debug key (development builds only)"
+            echo "- Download it from the **Artifacts** section of this run: \`jarvis-debug-apk\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-debug-apk
+          path: ${{ steps.apk.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildozer-build-log
+          path: buildozer-build.log
+          if-no-files-found: ignore
+          retention-days: 7
